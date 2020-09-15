@@ -19,10 +19,11 @@ module Clash.Core.PartialEval.NormalForm
   , Args
   , Neutral(..)
   , Value(..)
+  , collectValueApps
   , mkValueTicks
   , stripValue
   , collectValueTicks
-  , renameValue
+  , isUndefined
   , Normal(..)
   , LocalEnv(..)
   , GlobalEnv(..)
@@ -31,27 +32,22 @@ module Clash.Core.PartialEval.NormalForm
 
 import Control.Concurrent.Supply (Supply)
 import Control.Lens (Lens', lens)
-import Data.Bifunctor (first, second)
 import Data.IntMap.Strict (IntMap)
 import Data.Map.Strict (Map)
 
 import Clash.Core.DataCon (DataCon)
 import Clash.Core.Literal
-import Clash.Core.Subst
-import Clash.Core.Term (Term(..), PrimInfo, TickInfo, Pat)
+import Clash.Core.Term (Term(..), PrimInfo(..), TickInfo, Pat)
 import Clash.Core.TyCon (TyConMap)
 import Clash.Core.Type (Type, TyVar)
 import Clash.Core.Var (Id)
 import Clash.Core.VarEnv (VarEnv, InScopeSet)
 import Clash.Driver.Types (Binding(..))
 
-type Args a
-  = [Arg a]
-
 -- | An argument applied to a function / data constructor / primitive.
 --
-type Arg a
-  = Either a Type
+type Arg a = Either a Type
+type Args a = [Arg a]
 
 -- | Neutral terms cannot be reduced, as they represent things like variables
 -- which are unknown, partially applied functions, or case expressions where
@@ -101,6 +97,16 @@ data Value
   | VThunk    !Term !LocalEnv
   deriving (Show)
 
+collectValueApps :: Value -> Maybe (Neutral Value, Args Value)
+collectValueApps (VNeutral n) = Just (go [] n)
+ where
+  go !args = \case
+    NeApp x y -> go (Left y : args) x
+    NeTyApp x ty -> go (Right ty : args) x
+    neu -> (neu, args)
+
+collectValueApps _ = Nothing
+
 mkValueTicks :: Value -> [TickInfo] -> Value
 mkValueTicks = foldl VTick
 
@@ -114,60 +120,19 @@ collectValueTicks = go []
     VTick v tick -> go (tick : acc) v
     value -> (value, acc)
 
--- | Rename all occurances of the variables which appear as keys in the input
--- list. This is used to deShadow values, as we do not have a substitution
--- function for Value.
---
--- TODO In the future it might be nice to move operations common to different
--- core-like forms into clases, i.e. classes for substitution or free variable
--- lookup. But it's a lot of re-plumbing things for now.
---
-renameValue :: InScopeSet -> [(Id, Id)] -> Value -> Value
-renameValue inScope rn = go
- where
-  go :: Value -> Value
-  go = \case
-    VNeutral neu -> VNeutral (goNeu neu)
-    VLiteral lit -> VLiteral lit
-    VData dc args env -> VData dc (goArgs args) (goEnv env)
-    VLam i x env ->
-      case lookup i rn of
-        Just j  -> VLam j (goTerm x) (goEnv env)
-        Nothing -> VLam i (goTerm x) (goEnv env)
+isUndefined :: Value -> Bool
+isUndefined = \case
+  VNeutral (NePrim pr [Right _a]) ->
+    primName pr `elem`
+      [ "Control.Exception.Base.absentError"
+      , "Control.Exception.Base.patError"
+      , "EmptyCase"
+      , "GHC.Err.undefined"
+      , "Clash.Transformations.undefined"
+      , "Clash.XException.errorX"
+      ]
 
-    VTyLam i x env -> VTyLam i (goTerm x) (goEnv env)
-    VCast x a b -> VCast (go x) a b
-    VTick x tick -> VTick (go x) tick
-    VThunk x env -> VThunk (goTerm x) (goEnv env)
-
-  goNeu :: Neutral Value -> Neutral Value
-  goNeu = \case
-    NeVar i ->
-      case lookup i rn of
-        Just j  -> NeVar j
-        Nothing -> NeVar i
-
-    NePrim pr args -> NePrim pr (goArgs args)
-    NeApp n x -> NeApp (goNeu n) (go x)
-    NeTyApp n ty -> NeTyApp (goNeu n) ty
-    NeLetrec bs x -> NeLetrec (goSecond bs) (go x)
-    NeCase x ty alts -> NeCase (go x) ty (goSecond alts)
-
-  goArgs :: [Arg Value] -> [Arg Value]
-  goArgs  = fmap (first go)
-
-  goSecond :: [(a, Value)] -> [(a, Value)]
-  goSecond = fmap (second go)
-
-  goTerm :: Term -> Term
-  goTerm =
-    let subst = extendIdSubstList (mkSubst inScope) (second Var <$> rn)
-     in substTm "renameValue" subst
-
-  goEnv :: LocalEnv -> LocalEnv
-  goEnv = \case
-    env@LocalEnv{lenvValues=values} ->
-      env { lenvValues = fmap go values }
+  _ -> False
 
 -- | A term which is in beta-normal eta-long form (NF). This has no redexes,
 -- and all partially applied functions in sub-terms are eta-expanded.
